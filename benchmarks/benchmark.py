@@ -76,7 +76,8 @@ def benchmark_cosine_similarity(sizes, dtype=torch.float32, iters=20):
     return results
 
 
-def benchmark_topk(sizes, k=100, iters=50):
+def benchmark_topk(sizes, k=32, iters=50):
+    # The custom top-k kernel supports k <= 32.
     results = []
     for num_q, db_size in sizes:
         torch.cuda.empty_cache()

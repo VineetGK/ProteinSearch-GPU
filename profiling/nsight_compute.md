@@ -84,7 +84,7 @@ ncu --kernel-name "topk*" \
   python -c "
 import torch, protein_search_gpu as psg
 sims = torch.randn(64, 100000, device='cuda')
-for _ in range(10): psg.topk(sims, 100)
+for _ in range(10): psg.topk(sims, 32)  # custom kernel supports k <= 32
 "
 ```
 
@@ -144,28 +144,25 @@ Check **Compute Throughput**:
 
 ## Optimization Checklist
 
-### For Cosine Similarity (Memory Bound)
-- [ ] Vectorized loads (float4) - ✓ Implemented
-- [ ] Shared memory tiling - ✓ Implemented
-- [ ] Grid stride loops - ✓ Implemented
-- [ ] Coalesced access patterns - ✓ Check NCU
-- [ ] Optimal block size (256) - ✓ Check NCU
+Current state of the kernels (simple, correctness-first implementations):
 
-### For Top-K (Compute Bound)
-- [ ] Warp-level primitives - ✓ Implemented
-- [ ] Bitonic sort in registers - ✓ Implemented
-- [ ] Minimal shared memory - ✓ Implemented
-- [ ] Branch divergence minimized - Check NCU
+### For Cosine Similarity (dot product of L2-normalized inputs)
+- [x] float4 loads when dim % 4 == 0 and pointers are 16-byte aligned (scalar fallback otherwise)
+- [ ] Shared-memory tiling / GEMM-style blocking (not implemented; one thread per query-row pair)
+- [ ] Coalesced access patterns (check NCU; database rows are read per thread)
 
-### For L2 Normalize (Memory Bound)
-- [ ] Vectorized loads - ✓ Implemented
-- [ ] Block reduction - ✓ Implemented
-- [ ] Coalesced writes - ✓ Check NCU
+### For Top-K (k <= 32)
+- [x] Per-thread sorted candidate lists
+- [x] Block-level merge via warp-shuffle argmax (k rounds)
+- [ ] Warp-level bitonic sort (not implemented)
 
-### For Smith-Waterman (Compute Bound)
-- [ ] Wavefront parallelism - ✓ Implemented
-- [ ] Shared memory for DP matrix - Check NCU
-- [ ] Register blocking - Check NCU
+### For L2 Normalize
+- [x] float4 loads (when aligned)
+- [x] Warp-shuffle block reduction
+
+### For Smith-Waterman
+- [x] One thread per pair, linear-memory DP rows in global scratch
+- [ ] Wavefront / striped parallelism (not implemented)
 
 ## Reporting
 

@@ -158,23 +158,18 @@ for _ in range(100):
 
 ### Compare with PyTorch Baseline
 
+`benchmarks/benchmark.py` runs the custom kernels and the PyTorch
+(`torch.matmul`) baseline in the same process, so a single trace shows both.
+A FAISS baseline is not implemented.
+
 ```bash
-# Custom kernels
-nsys profile -o custom_kernels python benchmark.py --impl custom
-
-# PyTorch matmul
-nsys profile -o pytorch_matmul python benchmark.py --impl pytorch
-
-# FAISS
-nsys profile -o faiss python benchmark.py --impl faiss
+nsys profile -o custom_vs_pytorch python benchmarks/benchmark.py --quick
 ```
 
 ### Generate Comparison Report
 
 ```bash
-nsys stats --report gputrace custom_kernels.nsys-rep > custom_stats.txt
-nsys stats --report gputrace pytorch_matmul.nsys-rep > pytorch_stats.txt
-nsys stats --report gputrace faiss.nsys-rep > faiss_stats.txt
+nsys stats --report gputrace custom_vs_pytorch.nsys-rep > gputrace.txt
 ```
 
 ## Common Issues

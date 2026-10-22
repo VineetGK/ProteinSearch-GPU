@@ -2,25 +2,25 @@ protein-semsearch-gpu
 
 ### CUDA-Accelerated Semantic Protein Retrieval with Biological Re-ranking
 
-> A high-performance semantic protein search engine that combines transformer embeddings, custom CUDA kernels, and biological sequence alignment to retrieve similar proteins from hundreds of thousands of sequences. Built to demonstrate GPU systems engineering, CUDA optimization, and AI infrastructure for computational biology.
+> A semantic protein search engine that combines transformer embeddings, custom CUDA kernels, and biological sequence alignment to retrieve similar proteins. Built to learn GPU systems engineering, CUDA kernel design, and AI infrastructure for computational biology.
+
+**Status:** early stage. The kernels are deliberately simple, correctness-first implementations with tests against PyTorch references. They are not yet tuned, and no performance or retrieval numbers have been measured yet (see [Results](#results)).
 
 ---
 
 ## Motivation
 
-Modern protein foundation models such as ESM-2 produce embeddings that capture structural and functional similarity beyond traditional sequence alignment. Searching these embeddings efficiently across hundreds of thousands or millions of proteins requires GPU-optimized retrieval pipelines rather than brute-force CPU computation.
+Modern protein foundation models such as ESM-2 produce embeddings that capture structural and functional similarity beyond traditional sequence alignment. Searching these embeddings across hundreds of thousands or millions of proteins calls for GPU retrieval pipelines rather than brute-force CPU computation.
 
-ProteinSearch-GPU is an educational yet production-inspired implementation of an exact semantic protein search engine. Instead of relying solely on existing libraries such as cuBLAS or FAISS, this project implements the core retrieval primitives directly in CUDA to explore GPU architecture, memory optimization, and kernel design.
+ProteinSearch-GPU is an educational implementation of an exact semantic protein search engine. Instead of relying solely on existing libraries such as cuBLAS or FAISS, this project implements the core retrieval primitives directly in CUDA to explore GPU architecture, memory behaviour, and kernel design.
 
 The pipeline performs:
 
-* Transformer-based protein embedding generation
-* Custom CUDA cosine similarity computation
-* Warp-level Top-K candidate selection
+* Transformer-based protein embedding generation (ESM-2)
+* L2 normalization and dot-product (cosine) similarity in custom CUDA kernels
+* Block-level Top-K candidate selection (k ≤ 32)
 * Biological re-ranking using Smith–Waterman alignment
-* End-to-end benchmarking and GPU profiling
-
-The goal is to understand how modern AI infrastructure systems are built rather than simply using existing frameworks.
+* Kernel benchmarking and GPU profiling guides
 
 ---
 
@@ -38,16 +38,16 @@ The goal is to understand how modern AI infrastructure systems are built rather 
                           │
                           ▼
               CUDA Kernel 2
-          Batched Cosine Similarity
+     Batched Dot-Product (Cosine) Similarity
                           │
                           ▼
               CUDA Kernel 3
-            Warp-Level Top-K
+          Block-Level Top-K (k ≤ 32)
                           │
                           ▼
               CUDA Kernel 4
-        Candidate Compression
-      (Top Indices + Similarities)
+             Candidate Gather
+        (embeddings of the Top-K rows)
                           │
                           ▼
       Smith–Waterman Biological Re-ranking
@@ -60,83 +60,73 @@ The goal is to understand how modern AI infrastructure systems are built rather 
 
 # Features
 
-* Custom CUDA kernels written from scratch
-* PyTorch C++/CUDA extension
-* Shared-memory optimized kernels
-* Warp-level reductions using shuffle intrinsics
-* Vectorized memory accesses
-* Mixed precision experiments (FP16/BF16)
-* Biological sequence re-ranking
-* GPU profiling with NVIDIA Nsight Compute
-* End-to-end retrieval benchmarks
-* Reproducible evaluation pipeline
+* Custom CUDA kernels exposed as a PyTorch C++/CUDA extension
+* Warp-shuffle reductions (L2 norm, Top-K merge)
+* float4 vectorized loads when the dimension is a multiple of 4 and pointers are 16-byte aligned, with a scalar fallback otherwise
+* FP32, FP16 and BF16 inputs for normalize, similarity and gather (always fp32 accumulation)
+* Kernels launch on PyTorch's current CUDA stream, with input validation and launch error checks
+* Smith–Waterman (BLOSUM62, affine gaps) for biological re-ranking
+* Retrieval metrics: Recall@K, Precision@K, MRR, nDCG@K, mAP
+* Correctness tests against PyTorch / pure-Python references (`tests/test_ops.py`)
+* Profiling guides for Nsight Compute and Nsight Systems
 
 ---
 
 # CUDA Kernels
 
-## Kernel 1 — L2 Normalize
+All ops live in `protein_search_gpu._C` and are re-exported as `protein_search_gpu.<op>`.
 
-Normalizes each protein embedding to unit length before similarity search.
+## Kernel 1 — L2 Normalize (`l2_normalize`, `l2_normalize_inplace`)
 
-### CUDA Concepts
+Normalizes each row to unit length: `x / max(||x||, 1e-12)`, matching `torch.nn.functional.normalize(x, dim=1)`.
 
-* Parallel reductions
-* Warp shuffle intrinsics
-* Shared memory
-* Coalesced memory access
-
----
-
-## Kernel 2 — Tiled Cosine Similarity
-
-Computes cosine similarity between a batch of query embeddings and a large embedding database.
-
-### CUDA Concepts
-
-* Shared-memory tiling
-* Grid-stride loops
-* Float4 vectorized loads
-* Loop unrolling
-* Occupancy optimization
+* One block per row
+* Warp-shuffle block reduction
+* float4 path for aligned fp32 rows
 
 ---
 
-## Kernel 3 — Warp-Level Top-K
+## Kernel 2 — Dot-Product Similarity (`cosine_similarity`)
 
-Efficiently finds the highest scoring candidates without sorting the entire similarity matrix.
+Computes `query @ database.T` in fp32. This is **cosine similarity only when both inputs are already L2-normalized**, so run `l2_normalize` first.
 
-### CUDA Concepts
-
-* Warp intrinsics
-* Bitonic sorting
-* Register-only computation
-* Branch minimization
+* One thread per (query, database row) pair, fp32 accumulation
+* float4 loads for aligned fp32 inputs
+* Not shared-memory tiled. `torch.matmul` (cuBLAS) is expected to be faster; a tiled GEMM-style kernel is future work.
 
 ---
 
-## Kernel 4 — Candidate Compression
+## Kernel 3 — Block-Level Top-K (`topk`, k ≤ 32)
 
-Compacts only the Top-K indices and scores into contiguous buffers.
+Finds the k highest scores per row without sorting the whole row.
 
-### CUDA Concepts
-
-* Parallel gather
-* Coalesced writes
-* Prefix indexing
+* One block per query row
+* Each thread keeps a small sorted candidate list for its strided slice of the row
+* The block merges the lists with k rounds of warp-shuffle argmax
+* Values match `torch.topk(sorted=True)`. Ties go to the smaller index. NaN ranks highest, as in `torch.topk`.
+* `k > 32` is rejected; use `torch.topk` for larger k
 
 ---
 
-## Kernel 5 (Optional) — GPU Smith–Waterman
+## Kernel 4 — Candidate Gather (`gather`)
 
-Wavefront dynamic programming for biological sequence alignment.
+Copies the embeddings of the Top-K indices into a contiguous `[num_queries, k, dim]` buffer.
 
-### CUDA Concepts
+* One block per output row, float4 copies when aligned
+* Out-of-range indices (for example `-1` padding) produce zero rows
 
-* Anti-diagonal DP
-* Shared-memory banding
-* Synchronization
-* Dynamic programming optimization
+---
+
+## Kernel 5 — GPU Smith–Waterman (`smith_waterman`, `smith_waterman_batch`)
+
+Local alignment scores for re-ranking candidates.
+
+* Inputs are int8 residue indices from `datasets.sequence_to_indices` (alphabet `ARNDCQEGHILKMFPSTWYVXUOBZJ`), plus per-row lengths
+* BLOSUM62 scoring (U, O and J are scored as X), stored in constant memory
+* Affine gaps (Gotoh): a gap of length L costs `gap_open + (L - 1) * gap_extend`. The defaults are 11/1, and the convention matches parasail and Biopython's `PairwiseAligner`.
+* `smith_waterman` scores all query×database pairs; `smith_waterman_batch` scores selected `(query, db)` pairs given as `pair_indices [num_pairs, 2]`
+* One thread per pair, with a linear-memory DP: one row of H/E per thread in a global scratch buffer, interleaved for coalescing
+* Not a striped or anti-diagonal wavefront kernel; those are future work
 
 ---
 
@@ -167,7 +157,42 @@ Wavefront dynamic programming for biological sequence alignment.
 * UniRef50
 * Pfam
 * Smith–Waterman
-* Parasail
+
+---
+
+# Installation
+
+Requirements: an NVIDIA GPU, a **CUDA build of PyTorch ≥ 2.0**, and the matching CUDA toolkit (`nvcc`; `CUDA_HOME` must be set or `nvcc` must be on `PATH`). The build fails with an error if the toolkit is missing. It does not silently skip the extension.
+
+```bash
+pip install torch            # CUDA build matching your toolkit
+pip install -r requirements.txt
+pip install --no-build-isolation -e .
+```
+
+`--no-build-isolation` is needed because `setup.py` imports PyTorch to build the extension.
+
+## Usage
+
+```python
+import torch
+import protein_search_gpu as psg
+
+db = psg.l2_normalize(torch.randn(100_000, 1280, device="cuda"))
+q = psg.l2_normalize(torch.randn(64, 1280, device="cuda"))
+
+sims = psg.cosine_similarity(q, db)          # [64, 100000] float32
+values, indices = psg.topk(sims, 10)         # k <= 32
+candidates = psg.gather(db, indices)         # [64, 10, 1280]
+```
+
+## Tests
+
+```bash
+pytest tests/
+```
+
+The op tests are skipped automatically when no CUDA device is present or the extension has not been built.
 
 ---
 
@@ -227,11 +252,11 @@ CUDA Similarity Search
 
 ↓
 
-Warp Top-K
+Top-K Selection
 
 ↓
 
-Candidate Compression
+Candidate Gather
 
 ↓
 
@@ -247,9 +272,10 @@ Final Results
 # Repository Structure
 
 ```text
-proteinsearch-gpu/
+ProteinSearch-GPU/
 
 ├── cuda/
+│   ├── common.cuh
 │   ├── normalize.cu
 │   ├── cosine.cu
 │   ├── topk.cu
@@ -260,22 +286,27 @@ proteinsearch-gpu/
 │   └── torch_extension.cpp
 │
 ├── python/
-│   ├── encoder.py
-│   ├── benchmark.py
-│   ├── evaluate.py
-│   └── datasets.py
+│   └── protein_search_gpu/
+│       ├── __init__.py
+│       ├── encoder.py
+│       ├── benchmark.py
+│       ├── evaluate.py
+│       ├── datasets.py
+│       └── fasta.py
+│
+├── tests/
+│   └── test_ops.py
+│
+├── benchmarks/
+│   └── benchmark.py
 │
 ├── profiling/
 │   ├── nsight_compute.md
-│   ├── nsight_systems.md
-│   └── reports/
+│   └── nsight_systems.md
 │
-├── benchmarks/
-│
-├── notebooks/
-│
-├── data/
-│
+├── setup.py
+├── requirements.txt
+├── LICENSE
 └── README.md
 ```
 
@@ -283,9 +314,15 @@ proteinsearch-gpu/
 
 # Benchmarks
 
+`benchmarks/benchmark.py` times the custom kernels and the PyTorch baselines (`torch.matmul`, `torch.topk`):
+
+```bash
+python benchmarks/benchmark.py --quick   # or --full
+```
+
 ## GPU Performance
 
-The following metrics are collected using NVIDIA Nsight Compute.
+These metrics are planned. They can be collected with NVIDIA Nsight Compute; none have been measured yet.
 
 | Metric                    | Description                          |
 | ------------------------- | ------------------------------------ |
@@ -304,13 +341,13 @@ The following metrics are collected using NVIDIA Nsight Compute.
 
 ## CUDA Metrics
 
-Measured using:
+Can be collected with:
 
 ```bash
-ncu --set full python benchmark.py
+ncu --set full python benchmarks/benchmark.py --quick
 ```
 
-Collected metrics include:
+Relevant metrics include:
 
 * sm__warps_active.avg.pct_of_peak_sustained_active
 * dram__bytes.sum.per_second
@@ -323,7 +360,7 @@ Collected metrics include:
 
 ## Scalability
 
-Benchmarks are performed across multiple database sizes.
+Planned database sizes:
 
 | Database Size | Purpose                    |
 | ------------- | -------------------------- |
@@ -336,7 +373,7 @@ Benchmarks are performed across multiple database sizes.
 
 ## Batch Sizes
 
-Experiments are repeated using
+Planned batch sizes:
 
 * Batch = 1
 * Batch = 8
@@ -350,9 +387,9 @@ Experiments are repeated using
 
 # Retrieval Evaluation
 
-Beyond raw GPU performance, ProteinSearch-GPU measures biological retrieval quality.
+Beyond raw GPU performance, ProteinSearch-GPU measures biological retrieval quality (`python/protein_search_gpu/evaluate.py`).
 
-Metrics include
+Metrics are averaged over queries that have at least one relevant item:
 
 * Recall@10
 * Recall@50
@@ -366,9 +403,7 @@ Metrics include
 
 # Biological Evaluation
 
-The retrieved proteins are evaluated using curated annotations.
-
-Experiments measure
+Planned experiments, using curated annotations:
 
 * Same Pfam family retrieval
 * Same UniProt annotation retrieval
@@ -380,46 +415,32 @@ Experiments measure
 
 # Baselines
 
-ProteinSearch-GPU is compared against
+## Implemented
 
-## GPU
+* PyTorch `torch.matmul` on normalized embeddings
+* PyTorch `torch.topk`
 
-* PyTorch + torch.matmul
-* PyTorch + cosine_similarity
+## Planned (not implemented)
+
 * FAISS (Flat Index)
-
-## CPU
-
-* NumPy
-* SciPy
-* BLASTP (retrieval quality reference)
-* MMseqs2 (retrieval quality and speed reference)
+* NumPy / SciPy CPU search
+* BLASTP and MMseqs2 (retrieval quality and speed references)
 
 ---
 
-# Mixed Precision Experiments
+# Mixed Precision
 
-The project evaluates
-
-* FP32
-* FP16
-* BF16
-
-Metrics collected
-
-* Throughput
-* Latency
-* Memory usage
-* Retrieval quality
-* Numerical error
+Normalize, similarity and gather accept FP32, FP16 and BF16 inputs with fp32 accumulation. Top-K takes fp32 scores. The benchmarks currently run FP32 only; FP16/BF16 throughput, memory, retrieval quality and numerical-error comparisons are not yet measured.
 
 ---
 
 # Profiling
 
+See `profiling/nsight_compute.md` and `profiling/nsight_systems.md`.
+
 ## Nsight Compute
 
-Kernel-level optimization
+Kernel-level analysis
 
 * Occupancy
 * Memory bandwidth
@@ -430,7 +451,7 @@ Kernel-level optimization
 
 ## Nsight Systems
 
-Pipeline-level profiling
+Pipeline-level analysis
 
 * CUDA kernel timeline
 * CPU scheduling
@@ -442,22 +463,24 @@ Pipeline-level profiling
 
 # Future Work
 
+* Shared-memory tiled / Tensor Core similarity kernel
+* Warp-level bitonic Top-K and support for k > 32
+* Striped or anti-diagonal wavefront Smith–Waterman
+* FAISS baseline
 * Approximate nearest-neighbor search (IVF, HNSW, Product Quantization)
 * Multi-GPU database sharding with NCCL
 * CUDA Graphs
 * Persistent CUDA kernels
-* Tensor Core optimization
 * Triton kernel implementation
 * FP8 inference experiments
-* Distributed retrieval across multiple GPUs
 
 ---
 
 # Results
 
-Performance numbers below are intentionally left blank until benchmarking is completed.
+**Not yet measured.** Every value below is a placeholder until benchmarks are run.
 
-## Throughput
+## Throughput (not yet measured)
 
 | Database | Batch | Queries/sec | Avg Latency |
 | -------- | ----- | ----------: | ----------: |
@@ -469,7 +492,7 @@ Performance numbers below are intentionally left blank until benchmarking is com
 
 ---
 
-## GPU Metrics
+## GPU Metrics (not yet measured)
 
 | Metric             | Result |
 | ------------------ | -----: |
@@ -483,7 +506,7 @@ Performance numbers below are intentionally left blank until benchmarking is com
 
 ---
 
-## Retrieval Metrics
+## Retrieval Metrics (not yet measured)
 
 | Metric       | Result |
 | ------------ | -----: |
@@ -496,19 +519,9 @@ Performance numbers below are intentionally left blank until benchmarking is com
 
 ---
 
-# Resume Highlights (After Benchmarking)
-
-* Built a CUDA-accelerated semantic protein retrieval engine using ESM-2 embeddings and custom GPU kernels, enabling exact similarity search across hundreds of thousands of proteins.
-* Implemented shared-memory tiled cosine similarity, warp-level Top-K selection, and candidate compression kernels optimized for high GPU occupancy and memory throughput.
-* Profiled GPU performance using NVIDIA Nsight Compute, optimizing memory bandwidth, warp efficiency, and kernel latency through vectorized loads and shared-memory tiling.
-* Integrated biological re-ranking with Smith–Waterman alignment to improve retrieval quality while limiting expensive sequence alignments to a small candidate set.
-* Benchmarked end-to-end retrieval performance against PyTorch and FAISS baselines across varying database sizes, batch sizes, and mixed-precision configurations.
-
----
-
 # License
 
-MIT License
+MIT License. See [LICENSE](LICENSE).
 
 ---
 

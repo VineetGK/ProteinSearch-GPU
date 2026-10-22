@@ -1,5 +1,7 @@
-torch>=2.0.0
-transformers>=4.30.0
-numpy>=1.21.0
-tqdm>=4.65.0
-pyyaml>=6.0
+# Runtime dependencies (kept in sync with install_requires in setup.py).
+torch>=2.0
+numpy>=1.21
+transformers>=4.30
+tqdm>=4.65
+# Tests
+pytest>=7

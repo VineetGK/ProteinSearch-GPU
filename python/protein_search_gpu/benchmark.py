@@ -15,10 +15,7 @@ def benchmark_l2_normalize(
 ) -> Dict[str, float]:
     torch.cuda.empty_cache()
     
-    if dtype == torch.float32:
-        input_tensor = torch.randn(num_vectors, dim, device='cuda', dtype=dtype)
-    else:
-        input_tensor = torch.randn(num_vectors, dim, device='cuda', dtype=dtype)
+    input_tensor = torch.randn(num_vectors, dim, device='cuda', dtype=dtype)
     
     import protein_search_gpu as psg
     
@@ -56,12 +53,8 @@ def benchmark_cosine_similarity(
 ) -> Dict[str, float]:
     torch.cuda.empty_cache()
     
-    if dtype == torch.float32:
-        queries = torch.randn(num_queries, dim, device='cuda', dtype=dtype)
-        database = torch.randn(db_size, dim, device='cuda', dtype=dtype)
-    else:
-        queries = torch.randn(num_queries, dim, device='cuda', dtype=dtype)
-        database = torch.randn(db_size, dim, device='cuda', dtype=dtype)
+    queries = torch.randn(num_queries, dim, device='cuda', dtype=dtype)
+    database = torch.randn(db_size, dim, device='cuda', dtype=dtype)
     
     import protein_search_gpu as psg
     
@@ -212,12 +205,8 @@ def benchmark_pytorch_cosine(
 ) -> Dict[str, float]:
     torch.cuda.empty_cache()
     
-    if dtype == torch.float32:
-        queries = torch.randn(num_queries, dim, device='cuda', dtype=dtype)
-        database = torch.randn(db_size, dim, device='cuda', dtype=dtype)
-    else:
-        queries = torch.randn(num_queries, dim, device='cuda', dtype=dtype)
-        database = torch.randn(db_size, dim, device='cuda', dtype=dtype)
+    queries = torch.randn(num_queries, dim, device='cuda', dtype=dtype)
+    database = torch.randn(db_size, dim, device='cuda', dtype=dtype)
     
     queries_norm = torch.nn.functional.normalize(queries, dim=-1)
     database_norm = torch.nn.functional.normalize(database, dim=-1)
@@ -296,33 +285,19 @@ def run_full_benchmark(
         for batch_size in batch_sizes:
             print(f"  Batch size: {batch_size}")
             
-            try:
-                cos_result = benchmark_cosine_similarity(batch_size, db_size, dim)
-                print(f"    CUDA cosine: {cos_result['per_iter_ms']:.2f} ms")
-            except Exception as e:
-                print(f"    CUDA cosine failed: {e}")
-                cos_result = {}
+            # No try/except here: a missing extension or a kernel error should
+            # fail loudly instead of producing an empty result row.
+            cos_result = benchmark_cosine_similarity(batch_size, db_size, dim)
+            print(f"    CUDA cosine: {cos_result['per_iter_ms']:.2f} ms")
             
-            try:
-                pytorch_cos_result = benchmark_pytorch_cosine(batch_size, db_size, dim)
-                print(f"    PyTorch cosine: {pytorch_cos_result['per_iter_ms']:.2f} ms")
-            except Exception as e:
-                print(f"    PyTorch cosine failed: {e}")
-                pytorch_cos_result = {}
+            pytorch_cos_result = benchmark_pytorch_cosine(batch_size, db_size, dim)
+            print(f"    PyTorch cosine: {pytorch_cos_result['per_iter_ms']:.2f} ms")
             
-            try:
-                topk_result = benchmark_topk(batch_size, db_size, k)
-                print(f"    CUDA topk: {topk_result['per_iter_ms']:.2f} ms")
-            except Exception as e:
-                print(f"    CUDA topk failed: {e}")
-                topk_result = {}
+            topk_result = benchmark_topk(batch_size, db_size, k)
+            print(f"    CUDA topk: {topk_result['per_iter_ms']:.2f} ms")
             
-            try:
-                pytorch_topk_result = benchmark_pytorch_topk(batch_size, db_size, k)
-                print(f"    PyTorch topk: {pytorch_topk_result['per_iter_ms']:.2f} ms")
-            except Exception as e:
-                print(f"    PyTorch topk failed: {e}")
-                pytorch_topk_result = {}
+            pytorch_topk_result = benchmark_pytorch_topk(batch_size, db_size, k)
+            print(f"    PyTorch topk: {pytorch_topk_result['per_iter_ms']:.2f} ms")
             
             results[db_size][batch_size] = {
                 'cuda_cosine': cos_result,
@@ -369,7 +344,7 @@ if __name__ == "__main__":
     parser.add_argument("--db-sizes", nargs="+", type=int, default=[10000, 100000])
     parser.add_argument("--batch-sizes", nargs="+", type=int, default=[1, 8, 32, 64])
     parser.add_argument("--dim", type=int, default=1280)
-    parser.add_argument("--k", type=int, default=10)
+    parser.add_argument("--k", type=int, default=10, help="top-k (custom kernel supports k <= 32)")
     parser.add_argument("--output", type=str, default="benchmark_results.json")
     parser.add_argument("--memory-only", action="store_true")
     

@@ -1,13 +1,14 @@
-import torch
-import protein_search_gpu as psg
 from protein_search_gpu.datasets import parse_fasta, ProteinDataset
 
 # Create a small test FASTA
 with open('test.fasta', 'w') as f:
     f.write('>seq1\nACDEFGHIKLMNPQRSTVWY\n>seq2\nACDEFGHIKLMNPQRSTVWYACDEFGHIKLMNPQRSTVWY\n')
 
-ids, seqs = parse_fasta('test.fasta')
-print(f'Parsed {len(seqs)} sequences')
+# parse_fasta returns a list of (id, sequence) tuples
+records = parse_fasta('test.fasta')
+ids = [seq_id for seq_id, _ in records]
+seqs = [seq for _, seq in records]
+print(f'Parsed {len(seqs)} sequences: {ids}')
 print(f'Lengths: {[len(s) for s in seqs]}')
 
 # Test ProteinDataset

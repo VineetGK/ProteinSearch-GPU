@@ -4,6 +4,10 @@ from typing import List, Dict, Tuple, Optional
 from collections import defaultdict
 import json
 
+# Averaging convention: every metric is averaged over the queries that have at
+# least one relevant item. Queries with no relevant items are skipped (they
+# neither add to the numerator nor to the denominator).
+
 
 def recall_at_k(
     retrieved: List[List[int]],
@@ -11,9 +15,9 @@ def recall_at_k(
     k: int
 ) -> float:
     total_recall = 0.0
-    num_queries = len(retrieved)
+    num_evaluated = 0
     
-    for i in range(num_queries):
+    for i in range(len(retrieved)):
         retrieved_k = set(retrieved[i][:k])
         relevant_set = set(relevant[i])
         
@@ -22,8 +26,9 @@ def recall_at_k(
             
         hits = len(retrieved_k & relevant_set)
         total_recall += hits / len(relevant_set)
+        num_evaluated += 1
     
-    return total_recall / num_queries if num_queries > 0 else 0.0
+    return total_recall / num_evaluated if num_evaluated > 0 else 0.0
 
 
 def precision_at_k(
@@ -31,20 +36,23 @@ def precision_at_k(
     relevant: List[List[int]],
     k: int
 ) -> float:
+    if k <= 0:
+        return 0.0
     total_precision = 0.0
-    num_queries = len(retrieved)
+    num_evaluated = 0
     
-    for i in range(num_queries):
+    for i in range(len(retrieved)):
         retrieved_k = set(retrieved[i][:k])
         relevant_set = set(relevant[i])
         
-        if k == 0:
+        if len(relevant_set) == 0:
             continue
             
         hits = len(retrieved_k & relevant_set)
         total_precision += hits / k
+        num_evaluated += 1
     
-    return total_precision / num_queries if num_queries > 0 else 0.0
+    return total_precision / num_evaluated if num_evaluated > 0 else 0.0
 
 
 def mean_reciprocal_rank(
@@ -52,16 +60,19 @@ def mean_reciprocal_rank(
     relevant: List[List[int]]
 ) -> float:
     mrr = 0.0
-    num_queries = len(retrieved)
+    num_evaluated = 0
     
-    for i in range(num_queries):
+    for i in range(len(retrieved)):
         relevant_set = set(relevant[i])
+        if not relevant_set:
+            continue
+        num_evaluated += 1
         for rank, idx in enumerate(retrieved[i], 1):
             if idx in relevant_set:
                 mrr += 1.0 / rank
                 break
     
-    return mrr / num_queries if num_queries > 0 else 0.0
+    return mrr / num_evaluated if num_evaluated > 0 else 0.0
 
 
 def ndcg_at_k(
@@ -76,14 +87,15 @@ def ndcg_at_k(
         )
     
     total_ndcg = 0.0
-    num_queries = len(retrieved)
+    num_evaluated = 0
     
-    for i in range(num_queries):
+    for i in range(len(retrieved)):
         relevant_set = set(relevant[i])
         if not relevant_set:
             continue
+        num_evaluated += 1
             
-        rel_scores = [1 if idx in relevant_set else 0 for idx in retrieved[i]]
+        rel_scores = [1 if idx in relevant_set else 0 for idx in retrieved[i][:k]]
         dcg = dcg_at_k(rel_scores, k)
         
         ideal_scores = [1] * min(len(relevant_set), k)
@@ -92,7 +104,7 @@ def ndcg_at_k(
         if idcg > 0:
             total_ndcg += dcg / idcg
     
-    return total_ndcg / num_queries if num_queries > 0 else 0.0
+    return total_ndcg / num_evaluated if num_evaluated > 0 else 0.0
 
 
 def average_precision(
@@ -118,8 +130,9 @@ def mean_average_precision(
     retrieved: List[List[int]],
     relevant: List[List[int]]
 ) -> float:
-    aps = [average_precision(retrieved[i], relevant[i]) for i in range(len(retrieved))]
-    return np.mean(aps) if aps else 0.0
+    aps = [average_precision(retrieved[i], relevant[i])
+           for i in range(len(retrieved)) if len(relevant[i]) > 0]
+    return float(np.mean(aps)) if aps else 0.0
 
 
 def compute_retrieval_metrics(
@@ -196,23 +209,31 @@ def compute_ranking_metrics(
     k_values: List[int] = [1, 5, 10, 50, 100],
     use_cuda_kernels: bool = True
 ) -> Dict:
-    import protein_search_gpu as psg
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if use_cuda_kernels and device.type != 'cuda':
+        raise RuntimeError("use_cuda_kernels=True requires a CUDA device")
+    query_embeddings = query_embeddings.to(device=device, dtype=torch.float32)
+    db_embeddings = db_embeddings.to(device=device, dtype=torch.float32)
     
-    query_norm = psg.l2_normalize(query_embeddings)
-    db_norm = psg.l2_normalize(db_embeddings)
+    k = min(max(k_values), db_embeddings.size(0))
     
     if use_cuda_kernels:
+        import protein_search_gpu as psg
+        query_norm = psg.l2_normalize(query_embeddings)
+        db_norm = psg.l2_normalize(db_embeddings)
         similarities = psg.cosine_similarity(query_norm, db_norm)
     else:
+        query_norm = torch.nn.functional.normalize(query_embeddings, dim=1)
+        db_norm = torch.nn.functional.normalize(db_embeddings, dim=1)
         similarities = torch.matmul(query_norm, db_norm.t())
     
-    retrieved_indices = []
-    for k in [max(k_values)]:
-        values, indices = (psg.topk(similarities, k) if use_cuda_kernels 
-                          else torch.topk(similarities, k, dim=1))
-        retrieved_indices.append(indices.cpu().tolist())
+    # The custom top-k kernel supports k <= 32; fall back to torch.topk above that.
+    if use_cuda_kernels and k <= 32:
+        _, indices = psg.topk(similarities, k)
+    else:
+        _, indices = torch.topk(similarities, k, dim=1)
     
-    retrieved = retrieved_indices[0]
+    retrieved = indices.cpu().tolist()
     
     results = {}
     

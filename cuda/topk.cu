@@ -1,204 +1,141 @@
-#include <cuda_runtime.h>
-#include <cstdint>
+// Row-wise top-k (largest first) for k <= 32. One block per query row.
+//
+// Phase 1: every thread scans a strided slice of the row and keeps the k best
+//          (value, index) pairs it has seen in a small sorted local list.
+// Phase 2: the block merges the per-thread lists with k rounds of block-wide
+//          argmax over the list heads; the winning thread pops its head.
+//
+// The union of the per-thread top-k lists always contains the row's top-k,
+// so the result matches torch.topk(sorted=True) values. Ties are broken by the
+// smaller index. NaN is treated as larger than any number, like torch.topk.
 
-#define WARP_SIZE 32
+#include "common.cuh"
 
-__inline__ __device__ float warp_reduce_max(float val) {
-    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-        float tmp = __shfl_down_sync(0xffffffff, val, offset);
-        val = fmaxf(val, tmp);
-    }
-    return __shfl_sync(0xffffffff, val, 0);
+namespace psg {
+namespace {
+
+constexpr int kTopkMaxK = 32;
+constexpr int kTopkThreads = 256;  // must be a multiple of 32
+
+// a strictly greater than b, with NaN ordered above every number.
+__device__ __forceinline__ bool greater_than(float a, float b) {
+  const bool a_nan = isnan(a);
+  const bool b_nan = isnan(b);
+  if (a_nan || b_nan) return a_nan && !b_nan;
+  return a > b;
 }
 
-__inline__ __device__ int warp_reduce_max_index(float val, int idx) {
-    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-        float tmp_val = __shfl_down_sync(0xffffffff, val, offset);
-        int tmp_idx = __shfl_down_sync(0xffffffff, idx, offset);
-        if (tmp_val > val) {
-            val = tmp_val;
-            idx = tmp_idx;
-        }
-    }
-    return __shfl_sync(0xffffffff, idx, 0);
+// Candidate ordering for the merge. idx < 0 marks an empty slot.
+__device__ __forceinline__ bool better(float va, int64_t ia, float vb,
+                                       int64_t ib) {
+  if ((ia >= 0) != (ib >= 0)) return ia >= 0;
+  if (greater_than(va, vb)) return true;
+  if (greater_than(vb, va)) return false;
+  return ia < ib;
 }
 
-__inline__ __device__ void warp_bitonic_sort(float* values, int* indices, int k) {
-    for (int stride = 1; stride < k; stride <<= 1) {
-        for (int offset = stride; offset > 0; offset >>= 1) {
-            int lane_id = threadIdx.x % WARP_SIZE;
-            int partner = lane_id ^ offset;
-            bool dir = (lane_id & stride) == 0;
-            
-            if (partner < k) {
-                float my_val = values[lane_id];
-                float partner_val = values[partner];
-                int my_idx = indices[lane_id];
-                int partner_idx = indices[partner];
-                
-                if ((my_val > partner_val) == dir) {
-                    values[lane_id] = partner_val;
-                    indices[lane_id] = partner_idx;
-                }
-            }
-        }
+// After the loop, lane 0 holds the warp's best candidate.
+__device__ __forceinline__ void warp_argmax(float& val, int64_t& idx) {
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    const float other_val = __shfl_down_sync(kFullMask, val, offset);
+    const int64_t other_idx = static_cast<int64_t>(
+        __shfl_down_sync(kFullMask, static_cast<long long>(idx), offset));
+    if (better(other_val, other_idx, val, idx)) {
+      val = other_val;
+      idx = other_idx;
     }
+  }
 }
 
-__global__ void topk_kernel(const float* __restrict__ similarities, 
-                            int64_t num_vectors,
-                            int64_t k,
-                            float* __restrict__ topk_values,
-                            int64_t* __restrict__ topk_indices) {
-    int64_t query_idx = blockIdx.x;
-    int lane_id = threadIdx.x % WARP_SIZE;
-    int warp_id = threadIdx.x / WARP_SIZE;
-    int warps_per_block = blockDim.x / WARP_SIZE;
-    
-    if (query_idx >= gridDim.x) return;
+__global__ void topk_kernel(const float* __restrict__ sims, int64_t n, int k,
+                            float* __restrict__ out_values,
+                            int64_t* __restrict__ out_indices) {
+  const int64_t row = blockIdx.x;
+  const float* s = sims + row * n;
 
-    const float* sim = similarities + query_idx * num_vectors;
-    
-    float local_values[32];
-    int local_indices[32];
-    
-    for (int i = 0; i < 32; ++i) {
-        local_values[i] = -1e30f;
-        local_indices[i] = -1;
+  // Phase 1: thread-local sorted (descending) list of up to k candidates.
+  float local_val[kTopkMaxK];
+  int64_t local_idx[kTopkMaxK];
+  int count = 0;
+  for (int64_t j = threadIdx.x; j < n; j += blockDim.x) {
+    const float v = s[j];
+    // Equal values do not displace earlier (smaller) indices.
+    if (count == k && !greater_than(v, local_val[k - 1])) continue;
+    int pos = count < k ? count : k - 1;  // when full, the last entry is dropped
+    while (pos > 0 && greater_than(v, local_val[pos - 1])) {
+      local_val[pos] = local_val[pos - 1];
+      local_idx[pos] = local_idx[pos - 1];
+      --pos;
     }
-    
-    for (int64_t i = lane_id + warp_id * WARP_SIZE; i < num_vectors; i += blockDim.x) {
-        float val = sim[i];
-        int idx = i;
-        
-        for (int j = 0; j < 32; ++j) {
-            if (val > local_values[j]) {
-                for (int m = 31; m > j; --m) {
-                    local_values[m] = local_values[m-1];
-                    local_indices[m] = local_indices[m-1];
-                }
-                local_values[j] = val;
-                local_indices[j] = idx;
-                break;
-            }
-        }
-    }
-    
-    for (int j = 0; j < 32; ++j) {
-        if (lane_id == j) {
-            warp_bitonic_sort(local_values, local_indices, 32);
-        }
-    }
-    
-    if (lane_id < k) {
-        int out_idx = query_idx * k + lane_id;
-        topk_values[out_idx] = local_values[lane_id];
-        topk_indices[out_idx] = local_indices[lane_id];
-    }
-}
+    local_val[pos] = v;
+    local_idx[pos] = j;
+    if (count < k) ++count;
+  }
 
-__global__ void topk_kernel_block(const float* __restrict__ similarities, 
-                                   int64_t num_vectors,
-                                   int64_t k,
-                                   float* __restrict__ topk_values,
-                                   int64_t* __restrict__ topk_indices) {
-    extern __shared__ float smem[];
-    int64_t query_idx = blockIdx.x;
-    int tid = threadIdx.x;
-    int lane_id = tid % WARP_SIZE;
-    int warp_id = tid / WARP_SIZE;
-    int warps_per_block = blockDim.x / WARP_SIZE;
-    
-    if (query_idx >= gridDim.x) return;
+  // Phase 2: k rounds of block-wide argmax over the list heads.
+  __shared__ float warp_val[32];
+  __shared__ int64_t warp_idx[32];
+  __shared__ int64_t winner_idx;
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int num_warps = blockDim.x >> 5;
+  int head = 0;
 
-    const float* sim = similarities + query_idx * num_vectors;
-    float* warp_values = smem;
-    int64_t* warp_indices = (int64_t*)(smem + warps_per_block * k);
-    
-    float local_values[32];
-    int local_indices[32];
-    
-    for (int i = 0; i < 32; ++i) {
-        local_values[i] = -1e30f;
-        local_indices[i] = -1;
-    }
-    
-    for (int64_t i = tid; i < num_vectors; i += blockDim.x) {
-        float val = sim[i];
-        int idx = i;
-        
-        for (int j = 0; j < 32; ++j) {
-            if (val > local_values[j]) {
-                for (int m = 31; m > j; --m) {
-                    local_values[m] = local_values[m-1];
-                    local_indices[m] = local_indices[m-1];
-                }
-                local_values[j] = val;
-                local_indices[j] = idx;
-                break;
-            }
-        }
-    }
-    
-    for (int j = 0; j < 32; ++j) {
-        if (lane_id == j) {
-            warp_bitonic_sort(local_values, local_indices, 32);
-        }
-    }
-    
-    if (lane_id < k) {
-        warp_values[warp_id * k + lane_id] = local_values[lane_id];
-        warp_indices[warp_id * k + lane_id] = local_indices[lane_id];
+  for (int r = 0; r < k; ++r) {
+    float v = head < count ? local_val[head] : 0.0f;
+    int64_t i = head < count ? local_idx[head] : -1;
+    warp_argmax(v, i);
+    if (lane == 0) {
+      warp_val[warp] = v;
+      warp_idx[warp] = i;
     }
     __syncthreads();
-    
-    if (warp_id == 0) {
-        float merge_values[32];
-        int merge_indices[32];
-        
-        for (int i = 0; i < k; ++i) {
-            merge_values[i] = -1e30f;
-            merge_indices[i] = -1;
-        }
-        
-        for (int w = 0; w < warps_per_block; ++w) {
-            for (int j = 0; j < k; ++j) {
-                float val = warp_values[w * k + j];
-                int idx = warp_indices[w * k + j];
-                
-                for (int m = 0; m < k; ++m) {
-                    if (val > merge_values[m]) {
-                        for (int n = k - 1; n > m; --n) {
-                            merge_values[n] = merge_values[n-1];
-                            merge_indices[n] = merge_indices[n-1];
-                        }
-                        merge_values[m] = val;
-                        merge_indices[m] = idx;
-                        break;
-                    }
-                }
-            }
-        }
-        
-        if (lane_id < k) {
-            topk_values[query_idx * k + lane_id] = merge_values[lane_id];
-            topk_indices[query_idx * k + lane_id] = merge_indices[lane_id];
-        }
+
+    if (warp == 0) {
+      v = lane < num_warps ? warp_val[lane] : 0.0f;
+      i = lane < num_warps ? warp_idx[lane] : -1;
+      warp_argmax(v, i);
+      if (lane == 0) {
+        winner_idx = i;
+        out_values[row * k + r] = v;
+        out_indices[row * k + r] = i;
+      }
     }
+    __syncthreads();
+
+    // Each index lives in exactly one thread's list, so exactly one thread pops.
+    if (head < count && local_idx[head] == winner_idx) ++head;
+    // The next round's first __syncthreads() orders this read of winner_idx
+    // before warp 0 overwrites it.
+  }
 }
 
-extern "C" void launch_topk(const float* similarities, int64_t num_vectors, int64_t k,
-                            float* topk_values, int64_t* topk_indices, int num_queries) {
-    int block_size = 256;
-    int grid_size = num_queries;
-    
-    size_t shared_mem = (block_size / WARP_SIZE) * k * (sizeof(float) + sizeof(int64_t));
-    topk_kernel_block<<<grid_size, block_size, shared_mem>>>(similarities, num_vectors, k, topk_values, topk_indices);
+}  // namespace
+
+std::vector<at::Tensor> topk(const at::Tensor& similarities, int64_t k) {
+  check_cuda(similarities, "similarities");
+  TORCH_CHECK(similarities.dim() == 2,
+              "similarities must be 2D [num_queries, db_size]");
+  TORCH_CHECK(similarities.scalar_type() == at::kFloat,
+              "similarities must be float32 (got ", similarities.scalar_type(), ")");
+  const int64_t num_queries = similarities.size(0);
+  const int64_t n = similarities.size(1);
+  TORCH_CHECK(k >= 1 && k <= kTopkMaxK, "k must be in [1, ", kTopkMaxK,
+              "] (got ", k, "); use torch.topk for larger k");
+  TORCH_CHECK(k <= n, "k (", k, ") must be <= db_size (", n, ")");
+  const c10::cuda::CUDAGuard guard(similarities.device());
+
+  const at::Tensor sims = similarities.contiguous();
+  at::Tensor values = at::empty({num_queries, k}, sims.options());
+  at::Tensor indices = at::empty({num_queries, k}, sims.options().dtype(at::kLong));
+  if (num_queries == 0) return {values, indices};
+
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  topk_kernel<<<grid_x(num_queries), kTopkThreads, 0, stream>>>(
+      sims.data_ptr<float>(), n, static_cast<int>(k), values.data_ptr<float>(),
+      indices.data_ptr<int64_t>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {values, indices};
 }
 
-extern "C" void launch_topk_simple(const float* similarities, int64_t num_vectors, int64_t k,
-                                    float* topk_values, int64_t* topk_indices, int num_queries) {
-    int block_size = 256;
-    int grid_size = num_queries;
-    topk_kernel<<<grid_size, block_size>>>(similarities, num_vectors, k, topk_values, topk_indices);
-}
+}  // namespace psg

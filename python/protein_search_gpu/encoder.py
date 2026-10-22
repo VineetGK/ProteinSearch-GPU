@@ -6,6 +6,23 @@ import numpy as np
 from tqdm import tqdm
 
 
+def _mean_pool_residues(hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    """Mean over residue tokens only.
+
+    The ESM tokenizer wraps each sequence as <cls> residues <eos> (followed by
+    padding), so the first token and the last attended token are excluded.
+    """
+    mask = attention_mask.clone()
+    lengths = mask.sum(dim=1)  # includes <cls> and <eos>
+    mask[:, 0] = 0
+    rows = torch.arange(mask.size(0), device=mask.device)
+    mask[rows, (lengths - 1).clamp(min=0)] = 0
+    mask = mask.unsqueeze(-1).to(hidden_states.dtype)
+    summed = (hidden_states * mask).sum(dim=1)
+    counts = mask.sum(dim=1).clamp(min=1)
+    return summed / counts
+
+
 class ESM2Encoder:
     def __init__(
         self,
@@ -51,19 +68,11 @@ class ESM2Encoder:
             )
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
             
-            if self.half_precision:
-                inputs = {k: v.half() if v.dtype == torch.float32 else v 
-                         for k, v in inputs.items()}
-            
             outputs = self.model(**inputs, output_hidden_states=True)
             hidden_states = outputs.hidden_states[layer]
             
             if pooling == "mean":
-                attention_mask = inputs["attention_mask"]
-                mask_expanded = attention_mask.unsqueeze(-1).expand(hidden_states.size()).float()
-                sum_embeddings = torch.sum(hidden_states * mask_expanded, dim=1)
-                sum_mask = torch.clamp(mask_expanded.sum(dim=1), min=1e-9)
-                embeddings = sum_embeddings / sum_mask
+                embeddings = _mean_pool_residues(hidden_states.float(), inputs["attention_mask"])
             elif pooling == "cls":
                 embeddings = hidden_states[:, 0]
             else:
@@ -83,18 +92,10 @@ class ESM2Encoder:
         )
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         
-        if self.half_precision:
-            inputs = {k: v.half() if v.dtype == torch.float32 else v 
-                     for k, v in inputs.items()}
-        
         outputs = self.model(**inputs, output_hidden_states=True)
         hidden_states = outputs.hidden_states[-1]
         
-        attention_mask = inputs["attention_mask"]
-        mask_expanded = attention_mask.unsqueeze(-1).expand(hidden_states.size()).float()
-        sum_embeddings = torch.sum(hidden_states * mask_expanded, dim=1)
-        sum_mask = torch.clamp(mask_expanded.sum(dim=1), min=1e-9)
-        embedding = sum_embeddings / sum_mask
+        embedding = _mean_pool_residues(hidden_states.float(), inputs["attention_mask"])
         
         return embedding.float().cpu().squeeze(0)
     
@@ -130,7 +131,7 @@ def encode_fasta(
     batch_size: int = 32,
     device: str = "cuda",
 ) -> Tuple[torch.Tensor, List[str]]:
-    from .datasets import read_fasta
+    from .fasta import read_fasta
     
     sequence_ids, sequences = read_fasta(fasta_path)
     
